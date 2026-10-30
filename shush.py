@@ -678,8 +678,8 @@ def run_smoke_test() -> bool:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--allegro", action="store_true",
-        help="also set up Allegro/CMake/Ninja/pkgconf and generate the Allegro starter project",
+        "--no-allegro", action="store_false", dest="allegro",
+        help="don't set up Allegro/CMake/Ninja/pkgconf or generate the Allegro starter project",
     )
     parser.add_argument(
         "--projects-dir", default=str(Path.home() / "cpp-projects"),
