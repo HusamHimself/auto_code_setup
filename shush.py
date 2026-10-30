@@ -768,3 +768,9 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+    """
+    make code runner include allegro so the button works just like f5 would.
+    f5 works with allegro, code runner doesn't.
+    """
