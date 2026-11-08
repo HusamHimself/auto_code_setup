@@ -443,8 +443,24 @@ def build_allegro_launch_json() -> dict:
 
 
 def build_allegro_settings_json() -> dict:
+    bin_path = msys2_bin_forward_slash()
     settings = build_console_settings_json()
     settings["C_Cpp.default.compileCommands"] = ["${workspaceFolder}/build/compile_commands.json"]
+
+    # this folder's settings win over the global ones, so in here the play button
+    # does what F5 does -- configure + build with CMake -- then runs app.exe.
+    configure = (
+        f'"{bin_path}/cmake.exe" -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug'
+        f' "-DCMAKE_CXX_COMPILER={bin_path}/g++.exe"'
+        f' "-DCMAKE_MAKE_PROGRAM={bin_path}/ninja.exe"'
+        f' "-DPKG_CONFIG_EXECUTABLE={bin_path}/pkgconf.exe"'
+    )
+    build = f'"{bin_path}/cmake.exe" --build build --target app'
+    settings["code-runner.executorMap"] = {
+        "cpp": f'cd /d "$workspaceRoot" && {configure} && {build} && build\\app.exe',
+    }
+    settings["code-runner.runInTerminal"] = True
+    settings["code-runner.saveAllFilesBeforeRun"] = True
     return settings
 
 
@@ -457,6 +473,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# tell pkg-config where MSYS2 keeps Allegro's .pc files. this only affects this
+# one cmake run, so the play button works without the F5 task's env setup.
+get_filename_component(TOOLCHAIN_BIN "${CMAKE_CXX_COMPILER}" DIRECTORY)
+set(ENV{PKG_CONFIG_PATH} "${TOOLCHAIN_BIN}/../lib/pkgconfig")
+
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(ALLEGRO REQUIRED IMPORTED_TARGET
     allegro-5 allegro_main-5 allegro_primitives-5)
@@ -465,6 +486,54 @@ add_executable(app main.cpp)
 target_link_libraries(app PRIVATE PkgConfig::ALLEGRO)
 target_compile_options(app PRIVATE -Wall -Wextra)
 target_link_options(app PRIVATE -static-libgcc -static-libstdc++)
+
+# after every build (F5 or play button), copy the DLLs app.exe needs and the
+# assets folder next to it, so build/ runs on any Windows 11 PC by double-click.
+add_custom_command(TARGET app POST_BUILD
+    COMMAND "${CMAKE_COMMAND}"
+        "-DAPP=$<TARGET_FILE:app>"
+        "-DASSETS=${CMAKE_SOURCE_DIR}/assets"
+        "-DSEARCH_DIR=${TOOLCHAIN_BIN}"
+        "-DOBJDUMP=${CMAKE_OBJDUMP}"
+        -P "${CMAKE_SOURCE_DIR}/copy_dlls.cmake"
+    VERBATIM)
+"""
+
+ALLEGRO_COPY_DLLS_CMAKE = """\
+# copies the DLLs app.exe needs (and assets/) into the folder app.exe is in.
+# CMakeLists.txt runs this after each build; you never run it yourself.
+cmake_minimum_required(VERSION 3.20)
+
+# reading a Windows .exe's list of needed DLLs, using MSYS2's objdump.
+set(CMAKE_GET_RUNTIME_DEPENDENCIES_PLATFORM "windows+pe")
+set(CMAKE_GET_RUNTIME_DEPENDENCIES_TOOL "objdump")
+set(CMAKE_GET_RUNTIME_DEPENDENCIES_COMMAND "${OBJDUMP}")
+
+# recursive: the DLLs app.exe needs, the DLLs those need, and so on.
+file(GET_RUNTIME_DEPENDENCIES
+    EXECUTABLES "${APP}"
+    DIRECTORIES "${SEARCH_DIR}"
+    PRE_EXCLUDE_REGEXES "^api-ms-" "^ext-ms-"
+    RESOLVED_DEPENDENCIES_VAR found
+    UNRESOLVED_DEPENDENCIES_VAR missing)
+
+# only copy DLLs that came from MSYS2. kernel32.dll and friends are part of
+# Windows itself and already on every PC.
+file(TO_CMAKE_PATH "${SEARCH_DIR}" search_dir)
+string(TOLOWER "${search_dir}/" search_dir)
+get_filename_component(app_dir "${APP}" DIRECTORY)
+foreach(dll IN LISTS found)
+    file(TO_CMAKE_PATH "${dll}" dll_path)
+    string(TOLOWER "${dll_path}" dll_lower)
+    string(FIND "${dll_lower}" "${search_dir}" pos)
+    if(pos EQUAL 0)
+        file(COPY "${dll}" DESTINATION "${app_dir}")
+    endif()
+endforeach()
+
+if(IS_DIRECTORY "${ASSETS}")
+    file(COPY "${ASSETS}" DESTINATION "${app_dir}")
+endif()
 """
 
 ALLEGRO_MAIN_CPP = """\
@@ -595,6 +664,10 @@ def generate_allegro_project(project_dir: Path) -> None:
     cmakelists_path = project_dir / "CMakeLists.txt"
     cmakelists_path.write_text(ALLEGRO_CMAKELISTS, encoding="utf-8")
     print(f"  wrote {cmakelists_path}")
+
+    copy_dlls_path = project_dir / "copy_dlls.cmake"
+    copy_dlls_path.write_text(ALLEGRO_COPY_DLLS_CMAKE, encoding="utf-8")
+    print(f"  wrote {copy_dlls_path}")
 
     main_cpp_path = project_dir / "main.cpp"
     main_cpp_path.write_text(ALLEGRO_MAIN_CPP, encoding="utf-8")
@@ -767,10 +840,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
-
-
-    """
-    make code runner include allegro so the button works just like f5 would.
-    f5 works with allegro, code runner doesn't.
-    """
+    code = main()
+    input("\npress Enter to close this window...")
+    sys.exit(code)
