@@ -85,6 +85,13 @@ def check_winget_available() -> bool:
 
 
 def install_vscode() -> bool:
+    # winget treats "install" on something already installed as "upgrade it",
+    # which downloads and reinstalls VS Code. so check first, same as MSYS2 does.
+    existing = find_code_cmd()
+    if existing is not None:
+        print(f"  VS Code's already installed ({existing}), so skipping the install.")
+        return True
+
     if not check_winget_available():
         print("  can't find winget on this machine. it ships with Windows 11 out of")
         print("  the box, so if it's missing something odd is going on -- try")
@@ -189,7 +196,8 @@ def install_msys2() -> bool:
         return False
 
     if MSYS2_ROOT.is_dir():
-        print(f"  MSYS2's already sitting at {MSYS2_ROOT} -- nothing to do here.")
+        print(f"  MSYS2's already installed at {MSYS2_ROOT}, so skipping the install.")
+        print("  next up is updating its packages, which can take several minutes.")
         return True
 
     result = run(
@@ -222,20 +230,40 @@ def msys2_bash() -> Path:
     return MSYS2_ROOT / "usr" / "bin" / "bash.exe"
 
 
-def run_pacman(args: list[str], label: str) -> bool:
+def run_pacman_live(args: list[str], label: str, timeout: int = 1800) -> int:
+    # pacman's output goes straight to this window instead of being captured,
+    # so you can watch the downloads. it also means a background helper that
+    # pacman leaves running (like gpg-agent) can't keep this script waiting.
     bash = msys2_bash()
     command_str = " ".join(args)
-    result = run([str(bash), "-lc", command_str], label=label)
+    print(f"  {label}")
+    try:
+        result = subprocess.run(
+            [str(bash), "-lc", command_str],
+            stdin=subprocess.DEVNULL,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"  pacman was still going after {timeout // 60} minutes, so giving up.")
+        return -1
+    return result.returncode
 
-    if result.returncode != 0:
+
+def run_pacman(args: list[str], label: str) -> bool:
+    if run_pacman_live(args, label) != 0:
         print("  that pacman step failed, see above.")
         return False
     return True
 
 
 def update_msys2_core() -> bool:
-    if not run_pacman(["pacman", "--noconfirm", "-Syuu"], label="updating MSYS2's core packages (pass 1 of 2)..."):
-        return False
+    # pass 1 can update MSYS2's own runtime. when that happens MSYS2 closes all
+    # of its own programs to finish -- including the one running pacman -- so
+    # pass 1 ending with an error is normal. pass 2 is the one that must work.
+    code = run_pacman_live(["pacman", "--noconfirm", "-Syuu"], label="updating MSYS2's core packages (pass 1 of 2)...")
+    if code != 0:
+        print("  pass 1 ended early -- normal when MSYS2 updates itself. carrying on.")
+
     if not run_pacman(["pacman", "--noconfirm", "-Syuu"], label="updating MSYS2's core packages (pass 2 of 2)..."):
         return False
     return True
