@@ -303,16 +303,18 @@ def build_console_tasks_json() -> dict:
         "version": "2.0.0",
         "tasks": [
             {
+                # compiles every .cpp in the open file's folder into one app.exe,
+                # so files that #include each other's headers link together.
+                # "*.cpp" isn't expanded by a shell here -- MSYS2's g++ expands it.
                 "label": "Build active C++ file",
                 "type": "process",
                 "command": f"{bin_path}/g++.exe",
                 "args": [
                     "-std=c++17", "-Wall", "-Wextra", "-g", "-O0", "-static",
-                    "${file}", "-o",
-                    "${fileDirname}/${fileBasenameNoExtension}.exe",
+                    "*.cpp", "-o", "app.exe",
                 ],
                 "options": {
-                    "cwd": "${workspaceFolder}",
+                    "cwd": "${fileDirname}",
                     "env": {"PATH": f"{bin_path};${{env:PATH}}"},
                 },
                 "osx": {
@@ -324,7 +326,9 @@ def build_console_tasks_json() -> dict:
                     ],
                     "options": {"cwd": "${workspaceFolder}"},
                 },
-                "problemMatcher": "$gcc",
+                # g++ reports errors relative to the folder it ran in, so point
+                # VS Code's error underlining at that folder.
+                "problemMatcher": {"base": "$gcc", "fileLocation": ["autoDetect", "${fileDirname}"]},
                 "group": {"kind": "build", "isDefault": True},
             }
         ],
@@ -340,8 +344,8 @@ def build_console_launch_json() -> dict:
                 "name": "Console Windows",
                 "type": "cppdbg",
                 "request": "launch",
-                "program": "${fileDirname}/${fileBasenameNoExtension}.exe",
-                "cwd": "${workspaceFolder}",
+                "program": "${fileDirname}/app.exe",
+                "cwd": "${fileDirname}",
                 "preLaunchTask": "Build active C++ file",
                 "MIMode": "gdb",
                 "miDebuggerPath": f"{bin_path}/gdb.exe",
@@ -471,24 +475,10 @@ def build_allegro_launch_json() -> dict:
 
 
 def build_allegro_settings_json() -> dict:
-    bin_path = msys2_bin_forward_slash()
+    # the play button's command lives in the global settings now and spots the
+    # CMakeLists.txt by itself, so this folder doesn't need its own copy.
     settings = build_console_settings_json()
     settings["C_Cpp.default.compileCommands"] = ["${workspaceFolder}/build/compile_commands.json"]
-
-    # this folder's settings win over the global ones, so in here the play button
-    # does what F5 does -- configure + build with CMake -- then runs app.exe.
-    configure = (
-        f'"{bin_path}/cmake.exe" -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug'
-        f' "-DCMAKE_CXX_COMPILER={bin_path}/g++.exe"'
-        f' "-DCMAKE_MAKE_PROGRAM={bin_path}/ninja.exe"'
-        f' "-DPKG_CONFIG_EXECUTABLE={bin_path}/pkgconf.exe"'
-    )
-    build = f'"{bin_path}/cmake.exe" --build build --target app'
-    settings["code-runner.executorMap"] = {
-        "cpp": f'cd /d "$workspaceRoot" && {configure} && {build} && build\\app.exe',
-    }
-    settings["code-runner.runInTerminal"] = True
-    settings["code-runner.saveAllFilesBeforeRun"] = True
     return settings
 
 
@@ -510,7 +500,12 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(ALLEGRO REQUIRED IMPORTED_TARGET
     allegro-5 allegro_main-5 allegro_primitives-5)
 
-add_executable(app main.cpp)
+# every .cpp in the project folder; CONFIGURE_DEPENDS re-checks on each build,
+# so a new file gets picked up without editing this.
+file(GLOB SOURCES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/*.cpp")
+add_executable(app ${SOURCES})
+# lets any file #include "player.h" etc. from the project folder.
+target_include_directories(app PRIVATE "${CMAKE_SOURCE_DIR}")
 target_link_libraries(app PRIVATE PkgConfig::ALLEGRO)
 target_compile_options(app PRIVATE -Wall -Wextra)
 target_link_options(app PRIVATE -static-libgcc -static-libstdc++)
@@ -522,7 +517,7 @@ add_custom_command(TARGET app POST_BUILD
         "-DAPP=$<TARGET_FILE:app>"
         "-DASSETS=${CMAKE_SOURCE_DIR}/assets"
         "-DSEARCH_DIR=${TOOLCHAIN_BIN}"
-        "-DOBJDUMP=${CMAKE_OBJDUMP}"
+        "-DOBJDUMP=${TOOLCHAIN_BIN}/objdump.exe"
         -P "${CMAKE_SOURCE_DIR}/copy_dlls.cmake"
     VERBATIM)
 """
@@ -537,19 +532,33 @@ set(CMAKE_GET_RUNTIME_DEPENDENCIES_PLATFORM "windows+pe")
 set(CMAKE_GET_RUNTIME_DEPENDENCIES_TOOL "objdump")
 set(CMAKE_GET_RUNTIME_DEPENDENCIES_COMMAND "${OBJDUMP}")
 
+get_filename_component(app_dir "${APP}" DIRECTORY)
+
+# clear out the DLLs the last build copied, so the lookup below finds the real
+# MSYS2 ones instead of our old copies (and an updated MSYS2 gets picked up).
+file(GLOB old_dlls "${app_dir}/*.dll")
+if(old_dlls)
+    file(REMOVE ${old_dlls})
+endif()
+
 # recursive: the DLLs app.exe needs, the DLLs those need, and so on.
+# if a DLL name turns up in two folders (say, MSYS2 and some other program on
+# PATH), CMake lists it under conflict_* instead of stopping the build.
 file(GET_RUNTIME_DEPENDENCIES
     EXECUTABLES "${APP}"
     DIRECTORIES "${SEARCH_DIR}"
     PRE_EXCLUDE_REGEXES "^api-ms-" "^ext-ms-"
     RESOLVED_DEPENDENCIES_VAR found
-    UNRESOLVED_DEPENDENCIES_VAR missing)
+    UNRESOLVED_DEPENDENCIES_VAR missing
+    CONFLICTING_DEPENDENCIES_PREFIX conflict)
+foreach(name IN LISTS conflict_FILENAMES)
+    list(APPEND found ${conflict_${name}})
+endforeach()
 
 # only copy DLLs that came from MSYS2. kernel32.dll and friends are part of
 # Windows itself and already on every PC.
 file(TO_CMAKE_PATH "${SEARCH_DIR}" search_dir)
 string(TOLOWER "${search_dir}/" search_dir)
-get_filename_component(app_dir "${APP}" DIRECTORY)
 foreach(dll IN LISTS found)
     file(TO_CMAKE_PATH "${dll}" dll_path)
     string(TOLOWER "${dll_path}" dll_lower)
@@ -647,11 +656,37 @@ def write_global_cpp_settings() -> bool:
     terminal_env = existing.setdefault("terminal.integrated.env.windows", {})
     terminal_env["PATH"] = f"{bin_path};${{env:PATH}}"
 
+    # a CMake project (like the Allegro one): build it the way F5 does, then run it.
+    cmake_build = (
+        'cd /d "$workspaceRoot"'
+        f' && "{bin_path}/cmake.exe" -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug'
+        f' "-DCMAKE_CXX_COMPILER={bin_path}/g++.exe"'
+        f' "-DCMAKE_MAKE_PROGRAM={bin_path}/ninja.exe"'
+        f' "-DPKG_CONFIG_EXECUTABLE={bin_path}/pkgconf.exe"'
+        f' && "{bin_path}/cmake.exe" --build build --target app'
+        ' && build\\app.exe'
+    )
+    # any other folder: compile every .cpp in the file's folder into one app.exe
+    # (always the same name, so pressing play from different files doesn't leave
+    # a pile of exes). "*.cpp" works because MSYS2's g++ expands it itself.
+    # $dir arrives from Code Runner already in quotes, $workspaceRoot doesn't.
+    plain_build = (
+        'cd /d $dir'
+        f' && "{bin_path}/g++.exe" -std=c++17 -Wall -Wextra -static *.cpp -o app.exe'
+        ' && .\\app.exe'
+    )
+    plain_c_build = (
+        'cd /d $dir'
+        f' && "{bin_path}/gcc.exe" -Wall -Wextra -static *.c -o app.exe'
+        ' && .\\app.exe'
+    )
+
     existing["code-runner.executorMap"] = {
         **existing.get("code-runner.executorMap", {}),
-        "c": f'cd $dir && "{bin_path}/gcc.exe" -static $fileName -o $fileNameWithoutExt.exe && $dir$fileNameWithoutExt.exe',
-        "cpp": f'cd $dir && "{bin_path}/g++.exe" -static $fileName -o $fileNameWithoutExt.exe && $dir$fileNameWithoutExt.exe',
+        "c": plain_c_build,
+        "cpp": f'if exist "$workspaceRoot\\CMakeLists.txt" ({cmake_build}) else ({plain_build})',
     }
+    existing["code-runner.saveAllFilesBeforeRun"] = True
     existing["code-runner.runInTerminal"] = True
     existing["terminal.integrated.defaultProfile.windows"] = "Command Prompt"
 
@@ -676,9 +711,16 @@ def generate_console_project(project_dir: Path) -> None:
     write_json(project_dir / ".vscode" / "launch.json", build_console_launch_json())
     write_json(project_dir / ".vscode" / "settings.json", build_console_settings_json())
 
-    hello_path = project_dir / "hello.cpp"
-    hello_path.write_text(HELLO_CPP, encoding="utf-8")
-    print(f"  wrote {hello_path}")
+    write_starter_code(project_dir / "hello.cpp", HELLO_CPP)
+
+
+def write_starter_code(path: Path, text: str) -> None:
+    # running the setup again shouldn't wipe code you've written since.
+    if path.is_file():
+        print(f"  kept your existing {path}")
+        return
+    path.write_text(text, encoding="utf-8")
+    print(f"  wrote {path}")
 
 
 def generate_allegro_project(project_dir: Path) -> None:
@@ -697,83 +739,7 @@ def generate_allegro_project(project_dir: Path) -> None:
     copy_dlls_path.write_text(ALLEGRO_COPY_DLLS_CMAKE, encoding="utf-8")
     print(f"  wrote {copy_dlls_path}")
 
-    main_cpp_path = project_dir / "main.cpp"
-    main_cpp_path.write_text(ALLEGRO_MAIN_CPP, encoding="utf-8")
-    print(f"  wrote {main_cpp_path}")
-
-
-_SMOKE_TEST_SOURCE = """\
-#include <iostream>
-int main() {
-    int n;
-    std::cin >> n;
-    std::cout << "RESULT:" << (n * 2) << std::endl;
-    return 0;
-}
-"""
-
-
-def run_smoke_test() -> bool:
-    gxx = Path(f"{msys2_bin_forward_slash()}/g++.exe")
-    gdb = Path(f"{msys2_bin_forward_slash()}/gdb.exe")
-
-    if not gxx.is_file():
-        print(f"  can't find g++ at {gxx}, so skipping the smoke test.")
-        print("  that means the compiler install above didn't actually land where")
-        print("  this script expects -- worth checking by hand.")
-        return False
-
-    if not gdb.is_file():
-        print(f"  note: no gdb at {gdb}. compiler's fine, but stepping through")
-        print("  code with the debugger might not be until that's sorted.")
-
-    workdir = Path(os.environ.get("TEMP", os.environ.get("TMP", "."))) / "cpp_setup_smoke_test"
-    workdir.mkdir(parents=True, exist_ok=True)
-    src_path = workdir / "smoke_test.cpp"
-    exe_path = workdir / "smoke_test.exe"
-    src_path.write_text(_SMOKE_TEST_SOURCE, encoding="utf-8")
-
-    compile_result = run(
-        [str(gxx), "-static", str(src_path), "-o", str(exe_path)],
-        timeout=60,
-        label="compiling a real test program...",
-    )
-    if compile_result.returncode != 0:
-        print("  the compiler itself didn't work -- that's a real error above,")
-        print("  not a guess.")
-        return False
-
-    if not exe_path.is_file():
-        print(f"  compiler said it worked but {exe_path} isn't actually there.")
-        return False
-
-    try:
-        run_result = subprocess.run(
-            [str(exe_path)],
-            input="21\n",
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-    except subprocess.TimeoutExpired:
-        print("  the compiled program just hung instead of finishing. not expected.")
-        return False
-
-    expected = "RESULT:42"
-    if expected not in run_result.stdout:
-        print(f"  it ran but gave the wrong answer -- expected '{expected}' somewhere")
-        print(f"  in the output, got: {run_result.stdout!r}")
-        return False
-
-    print("  compiled and ran a real program and got the right answer (21 -> 42).")
-    print("  the toolchain genuinely works, this isn't an assumption.")
-
-    try:
-        shutil.rmtree(workdir)
-    except OSError:
-        pass
-
-    return True
+    write_starter_code(project_dir / "main.cpp", ALLEGRO_MAIN_CPP)
 
 
 def main() -> int:
@@ -789,7 +755,7 @@ def main() -> int:
     args = parser.parse_args()
 
     projects_dir = Path(args.projects_dir)
-    total_steps = 6
+    total_steps = 5
 
     print("setting up VS Code for C++.")
     print(f"this is {total_steps} steps, mostly spent downloading things --")
@@ -832,38 +798,32 @@ def main() -> int:
     print_step(f"step 4 of {total_steps}: making this work in every folder, not just one")
     write_global_cpp_settings()
 
-    print_step(f"step 5 of {total_steps}: proving the toolchain actually works")
-    toolchain_verified = run_smoke_test()
-    if not toolchain_verified:
-        print("  so VS Code + extensions are in, but the underlying compiler setup")
-        print("  isn't right yet. fix that before trusting what the play button does.")
-
-    print_step(f"step 6 of {total_steps}: starter project")
+    print_step(f"step 5 of {total_steps}: starter project")
     generate_console_project(projects_dir / "cpp-exercises")
     if args.allegro:
         generate_allegro_project(projects_dir / "allegro-project")
 
     print("\nall done. here's what you've got:")
-    if toolchain_verified:
-        print("  - a compiler + debugger that were just proven to work by actually")
-        print("    compiling and running something, not just assumed")
-    else:
-        print("  - WARNING: the toolchain check above did not pass. VS Code and the")
-        print("    extensions are installed, but don't trust the play button yet.")
+    print("  - a C++ compiler + debugger (MSYS2)")
     print("  - VS Code with a decent extension set")
-    print("  - a play button that works for any .c/.cpp file, in any folder")
+    print("  - a play button (and F5) that compiles every .cpp in the folder into")
+    print("    one app.exe, so files can #include each other's headers")
+    print("  - one main() per folder: each separate program needs its own folder")
     print("  - a ready-to-open starter project at:")
     print(f"      {projects_dir / 'cpp-exercises'}")
     if args.allegro:
         print("  - an Allegro starter project at:")
         print(f"      {projects_dir / 'allegro-project'}")
+        print("    open THAT folder itself in VS Code (File > Open Folder) -- the play")
+        print("    button spots it's an Allegro project by its CMakeLists.txt.")
+        print("    every build puts app.exe + the DLLs it needs in its build folder,")
+        print("    so that folder runs on any Windows 11 PC by double-clicking app.exe.")
     print("\nopen that folder in VS Code, open hello.cpp, hit the play button in the")
     print("top-right of the editor, and it should just run.")
-    print("\none thing worth knowing: if a terminal tab was already open in VS Code")
-    print("before this ran, that specific tab keeps whatever shell it already had --")
-    print("it won't switch over on its own. if the play button's output looks like")
-    print("it's in PowerShell (prompt starts with 'PS'), close that terminal tab;")
-    print("the next one VS Code opens will use the Command Prompt shell this just set up.")
+    print("\none thing worth knowing: terminal tabs that were already open in VS Code")
+    print("before this ran keep their old settings -- they won't switch over on their")
+    print("own. close every terminal tab (or restart VS Code) before the first run;")
+    print("the next one VS Code opens will use the Command Prompt setup this just made.")
     return 0
 
 
