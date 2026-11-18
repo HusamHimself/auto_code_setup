@@ -8,6 +8,9 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
+import urllib.request
 from pathlib import Path
 
 try:
@@ -15,6 +18,9 @@ try:
 except ImportError:
     winreg = None
 
+
+# printed at the start of every run, so it is obvious which version ran.
+SCRIPT_VERSION = "2026-11-18d (play button installs anything missing)"
 
 MSYS2_ROOT = Path(r"C:\msys64")
 
@@ -84,42 +90,79 @@ def check_winget_available() -> bool:
     return shutil.which("winget") is not None
 
 
-def install_vscode() -> bool:
-    # winget treats "install" on something already installed as "upgrade it",
-    # which downloads and reinstalls VS Code. so check first, same as MSYS2 does.
+# official download links, used when winget is missing or fails (common on
+# fresh PCs and VMs, where winget often isn't working yet).
+VSCODE_DOWNLOAD_URL = "https://code.visualstudio.com/sha/download?build=stable&os=win32-x64-user"
+MSYS2_DOWNLOAD_URL = "https://repo.msys2.org/distrib/msys2-x86_64-latest.sfx.exe"
+
+# installer switches: silent, don't launch VS Code at the end, and don't add
+# VS Code to PATH (VS Code's installer does that by default -- not allowed here).
+VSCODE_INSTALLER_ARGS = "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /MERGETASKS=!runcode,!addtopath"
+
+
+def download(url: str, dest: Path) -> bool:
+    print(f"  downloading {url}")
+    try:
+        with urllib.request.urlopen(url, timeout=60) as response, dest.open("wb") as f:
+            total = int(response.headers.get("Content-Length") or 0)
+            done = 0
+            last_tenth = -1
+            while True:
+                chunk = response.read(1024 * 256)
+                if not chunk:
+                    break
+                f.write(chunk)
+                done += len(chunk)
+                if total:
+                    tenth = done * 10 // total
+                    if tenth != last_tenth:
+                        print(f"    {tenth * 10}%")
+                        last_tenth = tenth
+    except OSError as e:
+        print(f"  the download failed: {e}")
+        return False
+    return True
+
+
+def install_vscode() -> Path | None:
+    # VS Code already being installed is the normal case: find it and move on.
+    # success is judged by actually finding code.cmd afterwards, not by what
+    # winget prints (that text changes between versions and languages).
     existing = find_code_cmd()
     if existing is not None:
         print(f"  VS Code's already installed ({existing}), so skipping the install.")
-        return True
+        return existing
 
-    if not check_winget_available():
-        print("  can't find winget on this machine. it ships with Windows 11 out of")
-        print("  the box, so if it's missing something odd is going on -- try")
-        print("  grabbing 'App Installer' from the Microsoft Store and run this again.")
-        return False
+    if check_winget_available():
+        run(
+            [
+                "winget", "install",
+                "--id", "Microsoft.VisualStudioCode",
+                "-e",
+                "--source", "winget",
+                "--silent",
+                "--accept-source-agreements",
+                "--accept-package-agreements",
+                "--override", VSCODE_INSTALLER_ARGS,
+            ],
+            label="downloading and installing Visual Studio Code (via winget)...",
+        )
+        found = find_code_cmd()
+        if found is not None:
+            print("  Visual Studio Code is good to go.")
+            return found
+        print("  winget didn't manage it, so trying Microsoft's own installer instead.")
+    else:
+        print("  winget isn't available here, so using Microsoft's own installer instead.")
 
-    result = run(
-        [
-            "winget", "install",
-            "--id", "Microsoft.VisualStudioCode",
-            "-e",
-            "--source", "winget",
-            "--silent",
-            "--accept-source-agreements",
-            "--accept-package-agreements",
-        ],
-        label="downloading and installing Visual Studio Code...",
-    )
-
-    out = result.stdout.lower()
-    already_installed = "no available upgrade" in out or "already installed" in out
-
-    if result.returncode != 0 and not already_installed:
-        print("  Visual Studio Code didn't install.")
-        return False
-
-    print("  Visual Studio Code is good to go.")
-    return True
+    installer = Path(tempfile.gettempdir()) / "VSCodeUserSetup-x64.exe"
+    if download(VSCODE_DOWNLOAD_URL, installer):
+        run([str(installer), *VSCODE_INSTALLER_ARGS.split()],
+            label="installing Visual Studio Code...")
+    found = find_code_cmd()
+    if found is not None:
+        print("  Visual Studio Code is good to go.")
+    return found
 
 
 def _scan_uninstall_registry_for_vscode() -> Path | None:
@@ -187,47 +230,146 @@ def find_code_cmd() -> Path | None:
     if hit is not None:
         return hit
 
-    return _glob_search_for_code_cmd()
+    hit = _glob_search_for_code_cmd()
+    if hit is not None:
+        return hit
+
+    # installed somewhere unusual but on PATH: code.cmd sits in VS Code's bin
+    # folder (next to a "code" shell script, so look for code.cmd by name).
+    on_path = shutil.which("code")
+    if on_path is not None:
+        candidate = Path(on_path).parent / "code.cmd"
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def install_msys2() -> bool:
-    if not check_winget_available():
-        print("  can't find winget on this machine.")
-        return False
-
-    if MSYS2_ROOT.is_dir():
+    if (MSYS2_ROOT / "usr" / "bin" / "bash.exe").is_file():
         print(f"  MSYS2's already installed at {MSYS2_ROOT}, so skipping the install.")
         print("  next up is updating its packages, which can take several minutes.")
         return True
 
-    result = run(
-        [
-            "winget", "install",
-            "--id", "MSYS2.MSYS2",
-            "-e",
-            "--source", "winget",
-            "--silent",
-            "--accept-source-agreements",
-            "--accept-package-agreements",
-        ],
-        label="downloading and installing MSYS2 (this is what provides the real compiler + debugger)...",
-    )
+    if check_winget_available():
+        run(
+            [
+                "winget", "install",
+                "--id", "MSYS2.MSYS2",
+                "-e",
+                "--source", "winget",
+                "--silent",
+                "--accept-source-agreements",
+                "--accept-package-agreements",
+            ],
+            label="downloading and installing MSYS2 (via winget)...",
+        )
+        if (MSYS2_ROOT / "usr" / "bin" / "bash.exe").is_file():
+            print(f"  MSYS2 is in, at {MSYS2_ROOT}.")
+            return True
+        print("  winget didn't manage it, so using MSYS2's own archive instead.")
+    else:
+        print("  winget isn't available here, so using MSYS2's own archive instead.")
 
-    if result.returncode != 0:
-        print("  MSYS2 didn't install.")
-        return False
-
-    if not MSYS2_ROOT.is_dir():
-        print(f"  installer said it worked, but {MSYS2_ROOT} isn't there. something")
-        print("  weird happened -- worth a manual look.")
-        return False
-
-    print(f"  MSYS2 is in, at {MSYS2_ROOT}.")
-    return True
+    # the official self-extracting archive: unpacks straight into C:\msys64.
+    archive = Path(tempfile.gettempdir()) / "msys2-x86_64-latest.sfx.exe"
+    if download(MSYS2_DOWNLOAD_URL, archive):
+        run([str(archive), "-y", f"-o{MSYS2_ROOT.parent}"], label="unpacking MSYS2...")
+    if (MSYS2_ROOT / "usr" / "bin" / "bash.exe").is_file():
+        print(f"  MSYS2 is in, at {MSYS2_ROOT}.")
+        return True
+    print(f"  MSYS2 still isn't at {MSYS2_ROOT} after trying both ways.")
+    return False
 
 
 def msys2_bash() -> Path:
     return MSYS2_ROOT / "usr" / "bin" / "bash.exe"
+
+
+# pacman creates this file while it works and deletes it when done. if pacman
+# gets killed partway (say, the window was closed mid-update), the file stays
+# behind and every later pacman run fails with "unable to lock database".
+def pacman_lock() -> Path:
+    return MSYS2_ROOT / "var" / "lib" / "pacman" / "db.lck"
+
+
+def pacman_is_running() -> bool:
+    # tasklist lists every running program, one per line, as "name","pid",...
+    try:
+        result = subprocess.run(
+            ["tasklist", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    for line in result.stdout.splitlines():
+        name = line.split(",")[0].strip().strip('"').lower()
+        if name == "pacman.exe":
+            return True
+    return False
+
+
+def clear_stale_pacman_lock(max_wait: int = 600) -> bool:
+    lock = pacman_lock()
+    if not lock.is_file():
+        return True
+    # a pacman that's really running (an open MSYS2 window, say) gets to finish.
+    waited = 0
+    while pacman_is_running():
+        if waited == 0:
+            print("  another pacman is running right now -- waiting for it to finish...")
+        if waited >= max_wait:
+            print(f"  it's still running after {max_wait // 60} minutes, so giving up.")
+            return False
+        time.sleep(10)
+        waited += 10
+    # nothing is running, so the lock is a leftover from an interrupted run.
+    if lock.is_file():
+        try:
+            lock.unlink()
+        except OSError as e:
+            print(f"  couldn't remove the leftover lock file {lock}: {e}")
+            return False
+        print("  removed a leftover pacman lock (from an earlier run that got interrupted).")
+    return True
+
+
+class ConsoleModeGuard:
+    # MSYS2's bash changes this window's output settings and doesn't put them
+    # back when it exits, which makes every later line break show up as odd
+    # symbols. this saves the settings before bash runs and restores them after.
+    def __init__(self) -> None:
+        self.saved = None
+        if os.name != "nt":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.GetStdHandle.argtypes = [wintypes.DWORD]
+            k32.GetStdHandle.restype = wintypes.HANDLE
+            k32.GetConsoleMode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+            k32.GetConsoleMode.restype = wintypes.BOOL
+            k32.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            k32.SetConsoleMode.restype = wintypes.BOOL
+            handles = []
+            for std_id in (-11, -12):  # this window's normal and error output
+                handle = k32.GetStdHandle(std_id & 0xFFFFFFFF)
+                mode = wintypes.DWORD()
+                if handle and k32.GetConsoleMode(handle, ctypes.byref(mode)):
+                    handles.append((handle, mode.value))
+            self.saved = (k32, handles)
+        except Exception:
+            self.saved = None
+
+    def restore(self) -> None:
+        if self.saved is None:
+            return
+        k32, handles = self.saved
+        for handle, mode in handles:
+            try:
+                k32.SetConsoleMode(handle, mode)
+            except Exception:
+                pass
 
 
 def run_pacman_live(args: list[str], label: str, timeout: int = 1800) -> int:
@@ -237,6 +379,10 @@ def run_pacman_live(args: list[str], label: str, timeout: int = 1800) -> int:
     bash = msys2_bash()
     command_str = " ".join(args)
     print(f"  {label}")
+    if not clear_stale_pacman_lock():
+        return -1
+    sys.stdout.flush()
+    guard = ConsoleModeGuard()
     try:
         result = subprocess.run(
             [str(bash), "-lc", command_str],
@@ -244,8 +390,11 @@ def run_pacman_live(args: list[str], label: str, timeout: int = 1800) -> int:
             timeout=timeout,
         )
     except subprocess.TimeoutExpired:
+        guard.restore()
         print(f"  pacman was still going after {timeout // 60} minutes, so giving up.")
         return -1
+    guard.restore()
+    sys.stdout.flush()
     return result.returncode
 
 
@@ -279,7 +428,59 @@ def install_packages(packages: list[str]) -> bool:
     )
 
 
-def install_extensions(code_cmd: Path) -> bool:
+# files that must exist after installing, and the package each comes from.
+# pacman can report success yet leave something out (an interrupted earlier
+# run, say), so this checks the files themselves.
+BASE_FILES = {
+    "bin/g++.exe": "mingw-w64-ucrt-x86_64-gcc",
+    "bin/gcc.exe": "mingw-w64-ucrt-x86_64-gcc",
+    "bin/objdump.exe": "mingw-w64-ucrt-x86_64-binutils",
+    "bin/gdb.exe": "mingw-w64-ucrt-x86_64-gdb",
+}
+ALLEGRO_FILES = {
+    "bin/cmake.exe": "mingw-w64-ucrt-x86_64-cmake",
+    "bin/ninja.exe": "mingw-w64-ucrt-x86_64-ninja",
+    "include/allegro5/allegro.h": "mingw-w64-ucrt-x86_64-allegro",
+    "include/allegro5/allegro_primitives.h": "mingw-w64-ucrt-x86_64-allegro",
+    "lib/liballegro.dll.a": "mingw-w64-ucrt-x86_64-allegro",
+}
+
+
+def missing_files(required: dict) -> dict:
+    ucrt64 = MSYS2_ROOT / "ucrt64"
+    return {f: pkg for f, pkg in required.items() if not (ucrt64 / f).is_file()}
+
+
+def verify_packages(required: dict) -> bool:
+    missing = missing_files(required)
+    if not missing:
+        print("  checked: the compiler, debugger and libraries are all in place.")
+        return True
+
+    print("  these files didn't land:")
+    for f in missing:
+        print(f"    {MSYS2_ROOT / 'ucrt64' / f}")
+    packages = []
+    for pkg in missing.values():
+        if pkg not in packages:
+            packages.append(pkg)
+    # no --needed here: reinstall even if pacman thinks they're already in.
+    run_pacman(["pacman", "--noconfirm", "-S", *packages], label="reinstalling those packages...")
+
+    still_missing = missing_files(required)
+    if still_missing:
+        print("  still missing after reinstalling:")
+        for f in still_missing:
+            print(f"    {MSYS2_ROOT / 'ucrt64' / f}")
+        return False
+    print("  fixed: everything's in place now.")
+    return True
+
+
+def install_extensions(code_cmd: Path | None) -> bool:
+    if code_cmd is None:
+        print("  skipped: VS Code's command-line tool (code.cmd) couldn't be found.")
+        return False
     ok = True
     total = len(EXTENSIONS)
     for i, ext_id in enumerate(EXTENSIONS, start=1):
@@ -390,7 +591,6 @@ def build_allegro_tasks_json() -> dict:
                     "-DCMAKE_BUILD_TYPE=Debug",
                     f"-DCMAKE_CXX_COMPILER={bin_path}/g++.exe",
                     f"-DCMAKE_MAKE_PROGRAM={bin_path}/ninja.exe",
-                    f"-DPKG_CONFIG_EXECUTABLE={bin_path}/pkgconf.exe",
                 ],
                 "options": {
                     "cwd": "${workspaceFolder}",
@@ -491,14 +691,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# tell pkg-config where MSYS2 keeps Allegro's .pc files. this only affects this
-# one cmake run, so the play button works without the F5 task's env setup.
+# MSYS2's compiler already searches its own include/ and lib/ folders, where
+# Allegro lives, so the libraries can be linked by name with nothing else.
 get_filename_component(TOOLCHAIN_BIN "${CMAKE_CXX_COMPILER}" DIRECTORY)
-set(ENV{PKG_CONFIG_PATH} "${TOOLCHAIN_BIN}/../lib/pkgconfig")
-
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(ALLEGRO REQUIRED IMPORTED_TARGET
-    allegro-5 allegro_main-5 allegro_primitives-5)
 
 # every .cpp in the project folder; CONFIGURE_DEPENDS re-checks on each build,
 # so a new file gets picked up without editing this.
@@ -506,7 +701,12 @@ file(GLOB SOURCES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/*.cpp")
 add_executable(app ${SOURCES})
 # lets any file #include "player.h" etc. from the project folder.
 target_include_directories(app PRIVATE "${CMAKE_SOURCE_DIR}")
-target_link_libraries(app PRIVATE PkgConfig::ALLEGRO)
+# every Allegro library (fonts, images, audio...). ones you don't use cost
+# nothing: app.exe only ends up needing the DLLs whose functions it calls.
+target_link_libraries(app PRIVATE
+    allegro_ttf allegro_font allegro_acodec allegro_audio allegro_video
+    allegro_image allegro_color allegro_dialog allegro_memfile allegro_physfs
+    allegro_primitives allegro_main allegro)
 target_compile_options(app PRIVATE -Wall -Wextra)
 target_link_options(app PRIVATE -static-libgcc -static-libstdc++)
 
@@ -526,6 +726,13 @@ ALLEGRO_COPY_DLLS_CMAKE = """\
 # copies the DLLs app.exe needs (and assets/) into the folder app.exe is in.
 # CMakeLists.txt runs this after each build; you never run it yourself.
 cmake_minimum_required(VERSION 3.20)
+
+# run.cmd passes Windows-style paths (with backslashes); switch them to the
+# forward-slash form CMake expects.
+file(TO_CMAKE_PATH "${APP}" APP)
+file(TO_CMAKE_PATH "${ASSETS}" ASSETS)
+file(TO_CMAKE_PATH "${SEARCH_DIR}" SEARCH_DIR)
+file(TO_CMAKE_PATH "${OBJDUMP}" OBJDUMP)
 
 # reading a Windows .exe's list of needed DLLs, using MSYS2's objdump.
 set(CMAKE_GET_RUNTIME_DEPENDENCIES_PLATFORM "windows+pe")
@@ -629,73 +836,477 @@ def vscode_user_settings_path() -> Path:
     return Path(os.path.expandvars(r"%APPDATA%\Code\User\settings.json"))
 
 
-def write_global_cpp_settings() -> bool:
-    settings_path = vscode_user_settings_path()
-    bin_path = msys2_bin_forward_slash()
+RUNNER_DIR = MSYS2_ROOT / "vscode-runner"
 
-    existing: dict = {}
-    if settings_path.is_file():
-        raw = settings_path.read_text(encoding="utf-8")
-        if raw.strip():
-            try:
-                existing = json.loads(raw)
-            except json.JSONDecodeError:
-                backup_path = settings_path.with_suffix(".json.bak")
-                shutil.copy(settings_path, backup_path)
-                print(f"  heads up: {settings_path} didn't parse as plain JSON (probably")
-                print(f"  has // comments in it, which VS Code allows but this script's")
-                print(f"  parser doesn't). backed it up to {backup_path} and starting")
-                print(f"  fresh for this write -- copy anything important back by hand.")
-                existing = {}
+# every Allegro library MSYS2 ships. linking one the program doesn't use costs
+# nothing: the exe only ends up needing the DLLs whose functions it calls.
+ALLEGRO_LIBS = [
+    "allegro_ttf", "allegro_font", "allegro_acodec", "allegro_audio",
+    "allegro_video", "allegro_image", "allegro_color", "allegro_dialog",
+    "allegro_memfile", "allegro_physfs", "allegro_primitives",
+    "allegro_main", "allegro",
+]
+
+# what the play button runs for C and C++, in every folder. it lives inside the
+# MSYS2 folder (a path with no spaces, so it needs no quotes to run).
+RUN_CMD_TEMPLATE = r"""@echo off
+rem What the VS Code play button runs for C and C++ (written by setup_cpp_vscode).
+rem   usage: run.cmd c-or-cpp "folder of the open file" "folder open in VS Code"
+rem setlocal: the PATH change below only lasts until this script ends.
+rem Windows' own PATH is never touched.
+setlocal
+
+set "MSYS_ROOT=@MSYS_ROOT@"
+set "UCRT=%MSYS_ROOT%\ucrt64"
+set "TOOLS=%UCRT%\bin"
+set "TOOLS_FWD=@BIN_FWD@"
+set "MSYS_BASH=%MSYS_ROOT%\usr\bin\bash.exe"
+set "PACMAN_LOCK=%MSYS_ROOT%\var\lib\pacman\db.lck"
+set "RUNNER=@RUNNER@"
+set "ALLEGRO_LIBS=@ALLEGRO_LIBS@"
+set "LANGUAGE=%~1"
+set "SRC=%~2"
+set "ROOT=%~3"
+set "ORIGINAL_PATH=%PATH%"
+set "PATH=%TOOLS%;%PATH%"
+
+if "%SRC:~-1%"=="\" set "SRC=%SRC:~0,-1%"
+if defined ROOT if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
+
+if /i "%LANGUAGE%"=="c" goto pick_c
+set "COMPILER=%TOOLS%\g++.exe"
+set "SOURCES=*.cpp"
+set "STANDARD=-std=c++17"
+goto picked
+:pick_c
+set "COMPILER=%TOOLS%\gcc.exe"
+set "SOURCES=*.c"
+set "STANDARD=-std=c17"
+:picked
+
+rem anything missing gets installed right here, so it works even if the
+rem setup was interrupted before it finished installing packages.
+call :need "%COMPILER%" mingw-w64-ucrt-x86_64-gcc || goto install_failed
+
+rem 1. a CMake project (like allegro-project): build it the way F5 does.
+set "PROJECT="
+if exist "%SRC%\CMakeLists.txt" set "PROJECT=%SRC%"
+if not defined PROJECT if defined ROOT if exist "%ROOT%\CMakeLists.txt" set "PROJECT=%ROOT%"
+if defined PROJECT goto cmake_project
+
+cd /d "%SRC%" || goto bad_folder
+
+rem 2. if any file here mentions allegro5, build with Allegro.
+call :detect_allegro "%SRC%"
+if defined USES_ALLEGRO goto allegro_folder
+
+rem 3. plain program: every source file in this folder becomes one app.exe
+rem that needs nothing else to run (-static).
+echo [building every %SOURCES% in this folder]
+"%COMPILER%" %STANDARD% -Wall -Wextra -static %SOURCES% -o app.exe || goto build_failed
+set "PATH=%ORIGINAL_PATH%"
+"%SRC%\app.exe"
+exit /b %ERRORLEVEL%
+
+:allegro_folder
+call :need_allegro || goto install_failed
+echo [building every %SOURCES% in this folder with Allegro]
+if not exist "%SRC%\build" mkdir "%SRC%\build"
+"%COMPILER%" %STANDARD% -Wall -Wextra %SOURCES% -o build\app.exe -static-libgcc -static-libstdc++ %ALLEGRO_LIBS% || goto build_failed
+"%TOOLS%\cmake.exe" "-DAPP=%SRC%\build\app.exe" "-DASSETS=%SRC%\assets" "-DSEARCH_DIR=%TOOLS_FWD%" "-DOBJDUMP=%TOOLS_FWD%/objdump.exe" -P "%RUNNER%\copy_dlls.cmake" || goto build_failed
+rem run it without MSYS2 on PATH, the way it would run on any other PC.
+set "PATH=%ORIGINAL_PATH%"
+"%SRC%\build\app.exe"
+exit /b %ERRORLEVEL%
+
+:cmake_project
+call :need "%TOOLS%\cmake.exe" mingw-w64-ucrt-x86_64-cmake || goto install_failed
+call :need "%TOOLS%\ninja.exe" mingw-w64-ucrt-x86_64-ninja || goto install_failed
+call :detect_allegro "%PROJECT%"
+if not defined USES_ALLEGRO goto cmake_build
+call :need_allegro || goto install_failed
+:cmake_build
+echo [building the CMake project in this folder]
+cd /d "%PROJECT%" || goto bad_folder
+"%TOOLS%\cmake.exe" -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug "-DCMAKE_CXX_COMPILER=%TOOLS_FWD%/g++.exe" "-DCMAKE_MAKE_PROGRAM=%TOOLS_FWD%/ninja.exe" || goto build_failed
+"%TOOLS%\cmake.exe" --build build || goto build_failed
+if not exist "%PROJECT%\build\app.exe" goto no_app
+set "PATH=%ORIGINAL_PATH%"
+"%PROJECT%\build\app.exe"
+exit /b %ERRORLEVEL%
+
+:no_app
+echo [built, but there is no build\app.exe to run]
+exit /b 0
+
+:bad_folder
+echo [could not open the folder "%SRC%"]
+exit /b 1
+
+:build_failed
+echo.
+echo [build failed -- see the errors above]
+exit /b 1
+
+:install_failed
+echo.
+echo [a package this program needs could not be installed -- see the messages above]
+exit /b 1
+
+rem ---- helpers, reached only through "call" ----
+
+:detect_allegro
+set "USES_ALLEGRO="
+for %%F in ("%~1\*.c" "%~1\*.cpp" "%~1\*.h" "%~1\*.hpp") do (
+    findstr /i /c:"allegro5" "%%~F" >nul 2>&1 && set "USES_ALLEGRO=1"
+)
+exit /b 0
+
+:need_allegro
+call :need "%UCRT%\include\allegro5\allegro.h" mingw-w64-ucrt-x86_64-allegro || exit /b 1
+call :need "%TOOLS%\cmake.exe" mingw-w64-ucrt-x86_64-cmake || exit /b 1
+call :need "%TOOLS%\objdump.exe" mingw-w64-ucrt-x86_64-binutils || exit /b 1
+exit /b 0
+
+:need
+rem first value: a file that must exist. second value: the package it comes from.
+if exist "%~1" exit /b 0
+echo [installing %~2 -- one time only, needs internet, can take a few minutes]
+rem -Syu updates MSYS2 and installs in one go. if MSYS2 has to update itself
+rem first, that closes pacman early, so a second round finishes the job.
+for %%N in (1 2) do (
+    if not exist "%~1" (
+        call :clear_stale_lock
+        "%MSYS_BASH%" -lc "pacman --noconfirm --needed -Syu %~2"
+    )
+)
+if exist "%~1" exit /b 0
+echo [still missing after installing: %~1]
+exit /b 1
+
+:clear_stale_lock
+rem pacman's lock file is left behind if pacman was ever killed mid-run; with
+rem no pacman running it is a leftover, so remove it. a real one gets to finish.
+set /a WAITED=0
+:lock_wait
+if not exist "%PACMAN_LOCK%" exit /b 0
+tasklist /FI "IMAGENAME eq pacman.exe" 2>nul | find /i "pacman.exe" >nul
+if errorlevel 1 goto lock_stale
+if %WAITED% GEQ 600 exit /b 1
+if %WAITED%==0 echo [another pacman is running -- waiting for it to finish]
+ping -n 6 127.0.0.1 >nul
+set /a WAITED+=5
+goto lock_wait
+:lock_stale
+del /f /q "%PACMAN_LOCK%" >nul 2>&1
+exit /b 0
+"""
+
+
+def runner_dir_backslash() -> str:
+    return str(RUNNER_DIR).replace("/", "\\")
+
+
+def build_run_cmd() -> str:
+    bin_fwd = msys2_bin_forward_slash()
+    text = RUN_CMD_TEMPLATE.replace("@MSYS_ROOT@", str(MSYS2_ROOT).replace("/", "\\"))
+    text = text.replace("@BIN_FWD@", bin_fwd)
+    text = text.replace("@RUNNER@", runner_dir_backslash())
+    text = text.replace("@ALLEGRO_LIBS@", " ".join("-l" + name for name in ALLEGRO_LIBS))
+    return text
+
+
+def write_runner_files() -> bool:
+    try:
+        RUNNER_DIR.mkdir(parents=True, exist_ok=True)
+        # batch files want Windows line endings; with plain \n, "goto" can
+        # land on the wrong line in longer scripts.
+        with open(RUNNER_DIR / "run.cmd", "w", encoding="ascii", newline="\r\n") as f:
+            f.write(build_run_cmd())
+        with open(RUNNER_DIR / "copy_dlls.cmake", "w", encoding="utf-8") as f:
+            f.write(ALLEGRO_COPY_DLLS_CMAKE)
+    except OSError as e:
+        print(f"  couldn't write the play button's build script into {RUNNER_DIR}: {e}")
+        return False
+    print(f"  wrote the play button's build script to {RUNNER_DIR}")
+    return True
+
+
+def strip_jsonc(text: str) -> str:
+    # VS Code's settings.json may contain // comments, /* */ comments and
+    # trailing commas, which Python's json module rejects. this removes them
+    # with a plain character loop, leaving anything inside "strings" alone.
+    out = []
+    i = 0
+    n = len(text)
+    in_string = False
+    while i < n:
+        c = text[i]
+        if in_string:
+            out.append(c)
+            if c == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if c == '"':
+                in_string = False
+            i += 1
+            continue
+        if c == '"':
+            in_string = True
+            out.append(c)
+            i += 1
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "/":
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "*":
+            i += 2
+            while i + 1 < n and not (text[i] == "*" and text[i + 1] == "/"):
+                i += 1
+            i += 2
+            continue
+        if c == ",":
+            j = i + 1
+            while j < n and text[j] in " \t\r\n":
+                j += 1
+            if j < n and text[j] in "}]":
+                i += 1
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def read_settings(path: Path, quiet: bool = False) -> dict:
+    if not path.is_file():
+        return {}
+    raw = path.read_text(encoding="utf-8-sig")
+    if not raw.strip():
+        return {}
+    try:
+        data = json.loads(strip_jsonc(raw))
+        if isinstance(data, dict):
+            return data
+    except json.JSONDecodeError:
+        pass
+    if quiet:
+        return {}
+    print(f"  heads up: couldn't read {path} even after removing comments,")
+    print("  so starting it fresh. your old copy is in the backup next to it.")
+    return {}
+
+
+C_FAMILY_EXTENSIONS = ["c", "cpp", "cc", "cxx", "c++", "h", "hpp", "hh", "hxx"]
+
+
+def glob_targets_c_family(pattern: str) -> bool:
+    # executorMapByGlob keys look like "*.cpp", "**/*.c" or "*.{c,cpp}".
+    dot = pattern.rfind(".")
+    if dot == -1:
+        return False
+    tail = pattern[dot + 1:].lower()
+    if tail[:1] == "{" and tail[-1:] == "}":
+        tail = tail[1:-1]
+    for ext in tail.split(","):
+        if ext.strip() in C_FAMILY_EXTENSIONS:
+            return True
+    return False
+
+
+def apply_cpp_settings(existing: dict) -> dict:
+    bin_path = msys2_bin_forward_slash()
 
     existing["C_Cpp.default.compilerPath"] = f"{bin_path}/g++.exe"
     existing["C_Cpp.default.cppStandard"] = "c++17"
     existing["C_Cpp.default.debuggerPath"] = f"{bin_path}/gdb.exe"
     existing["C_Cpp.debugShortcut"] = False
 
-    terminal_env = existing.setdefault("terminal.integrated.env.windows", {})
+    terminal_env = existing.get("terminal.integrated.env.windows")
+    if not isinstance(terminal_env, dict):
+        terminal_env = {}
     terminal_env["PATH"] = f"{bin_path};${{env:PATH}}"
+    existing["terminal.integrated.env.windows"] = terminal_env
 
-    # a CMake project (like the Allegro one): build it the way F5 does, then run it.
-    cmake_build = (
-        'cd /d "$workspaceRoot"'
-        f' && "{bin_path}/cmake.exe" -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug'
-        f' "-DCMAKE_CXX_COMPILER={bin_path}/g++.exe"'
-        f' "-DCMAKE_MAKE_PROGRAM={bin_path}/ninja.exe"'
-        f' "-DPKG_CONFIG_EXECUTABLE={bin_path}/pkgconf.exe"'
-        f' && "{bin_path}/cmake.exe" --build build --target app'
-        ' && build\\app.exe'
-    )
-    # any other folder: compile every .cpp in the file's folder into one app.exe
-    # (always the same name, so pressing play from different files doesn't leave
-    # a pile of exes). "*.cpp" works because MSYS2's g++ expands it itself.
-    # $dir arrives from Code Runner already in quotes, $workspaceRoot doesn't.
-    plain_build = (
-        'cd /d $dir'
-        f' && "{bin_path}/g++.exe" -std=c++17 -Wall -Wextra -static *.cpp -o app.exe'
-        ' && .\\app.exe'
-    )
-    plain_c_build = (
-        'cd /d $dir'
-        f' && "{bin_path}/gcc.exe" -Wall -Wextra -static *.c -o app.exe'
-        ' && .\\app.exe'
-    )
+    # the play button hands everything to run.cmd, which works out whether the
+    # folder is a CMake project, an Allegro program or a plain one.
+    # $dir arrives from Code Runner already in quotes; $workspaceRoot doesn't.
+    runner = runner_dir_backslash() + "\\run.cmd"
+    executor_map = existing.get("code-runner.executorMap")
+    if not isinstance(executor_map, dict):
+        executor_map = {}
+    executor_map["c"] = f'{runner} c $dir "$workspaceRoot"'
+    executor_map["cpp"] = f'{runner} cpp $dir "$workspaceRoot"'
+    existing["code-runner.executorMap"] = executor_map
 
-    existing["code-runner.executorMap"] = {
-        **existing.get("code-runner.executorMap", {}),
-        "c": plain_c_build,
-        "cpp": f'if exist "$workspaceRoot\\CMakeLists.txt" ({cmake_build}) else ({plain_build})',
-    }
+    # Code Runner checks these two maps BEFORE executorMap, so any C/C++ entry
+    # in them would quietly win. take those entries out.
+    by_glob = existing.get("code-runner.executorMapByGlob")
+    if isinstance(by_glob, dict):
+        for key in list(by_glob):
+            if glob_targets_c_family(key):
+                del by_glob[key]
+    by_ext = existing.get("code-runner.executorMapByFileExtension")
+    if isinstance(by_ext, dict):
+        for key in list(by_ext):
+            if key.lower().lstrip(".") in C_FAMILY_EXTENSIONS:
+                del by_ext[key]
+
     existing["code-runner.saveAllFilesBeforeRun"] = True
     existing["code-runner.runInTerminal"] = True
     existing["terminal.integrated.defaultProfile.windows"] = "Command Prompt"
+    return existing
 
-    settings_path.parent.mkdir(parents=True, exist_ok=True)
-    with settings_path.open("w", encoding="utf-8") as f:
-        json.dump(existing, f, indent=4)
 
-    print(f"  wrote global C/C++ defaults to {settings_path}")
+def vscode_user_dirs(code_cmd: Path | None) -> list[Path]:
+    # VS Code keeps settings in a different place depending on how it was
+    # installed. cover them all: normal, Insiders, VSCodium, and portable mode.
+    dirs = [vscode_user_settings_path().parent]
+    appdata = Path(os.path.expandvars("%APPDATA%"))
+    for flavour in ["Code - Insiders", "VSCodium"]:
+        user_dir = appdata / flavour / "User"
+        if user_dir.is_dir():
+            dirs.append(user_dir)
+    if code_cmd is not None:
+        # portable VS Code: <install folder>/data/user-data/User
+        portable = code_cmd.parent.parent / "data"
+        if portable.is_dir():
+            dirs.append(portable / "user-data" / "User")
+    return dirs
+
+
+def all_vscode_settings_files(code_cmd: Path | None = None) -> list[Path]:
+    # each VS Code profile keeps its own settings.json, and whichever profile
+    # is active is the one that counts -- so write every one of them.
+    paths = []
+    for user_dir in vscode_user_dirs(code_cmd):
+        paths.append(user_dir / "settings.json")
+        profiles_dir = user_dir / "profiles"
+        if profiles_dir.is_dir():
+            for profile in sorted(profiles_dir.iterdir()):
+                if profile.is_dir():
+                    paths.append(profile / "settings.json")
+    return paths
+
+
+def back_up_once(path: Path) -> None:
+    backup = path.with_name(path.name + ".before-cpp-setup")
+    if path.is_file() and not backup.exists():
+        shutil.copy(path, backup)
+
+
+def write_global_cpp_settings(code_cmd: Path | None = None) -> bool:
+    for settings_path in all_vscode_settings_files(code_cmd):
+        back_up_once(settings_path)
+        settings = apply_cpp_settings(read_settings(settings_path))
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        with settings_path.open("w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=4)
+        print(f"  wrote C/C++ settings to {settings_path}")
     return True
+
+
+RUNNER_KEYS = ["code-runner.executorMap", "code-runner.executorMapByGlob",
+               "code-runner.executorMapByFileExtension"]
+
+
+def remove_c_family_runner_entries(settings: dict) -> bool:
+    # takes out only the C/C++ play-button entries; other languages stay.
+    changed = False
+    executor_map = settings.get("code-runner.executorMap")
+    if isinstance(executor_map, dict):
+        for key in ["c", "cpp"]:
+            if key in executor_map:
+                del executor_map[key]
+                changed = True
+    by_glob = settings.get("code-runner.executorMapByGlob")
+    if isinstance(by_glob, dict):
+        for key in list(by_glob):
+            if glob_targets_c_family(key):
+                del by_glob[key]
+                changed = True
+    by_ext = settings.get("code-runner.executorMapByFileExtension")
+    if isinstance(by_ext, dict):
+        for key in list(by_ext):
+            if key.lower().lstrip(".") in C_FAMILY_EXTENSIONS:
+                del by_ext[key]
+                changed = True
+    for key in RUNNER_KEYS:
+        if isinstance(settings.get(key), dict) and not settings[key]:
+            del settings[key]
+    return changed
+
+
+# folders never worth searching for project settings (huge, or not projects).
+SKIP_FOLDERS = {"appdata", "node_modules", "__pycache__", "site-packages",
+                "venv", ".venv", "env", ".git", ".cache", "scoop", "go"}
+
+
+def clean_folder_overrides(top: Path, max_depth: int = 7, max_folders: int = 40000) -> list[Path]:
+    # a folder's own .vscode/settings.json (or a .code-workspace file) beats the
+    # global settings, so an old play-button command in one would keep winning
+    # there. look through the user's folders and take out just those entries.
+    cleaned = []
+    seen = 0
+    top_depth = len(top.parts)
+    for folder, subfolders, files in os.walk(top):
+        seen += 1
+        if seen > max_folders:
+            break
+        here = Path(folder)
+        candidates = []
+        if ".vscode" in subfolders:
+            candidates.append((here / ".vscode" / "settings.json", False))
+        for name in files:
+            if name.lower()[-15:] == ".code-workspace":
+                candidates.append((here / name, True))
+        for path, is_workspace_file in candidates:
+            if not path.is_file():
+                continue
+            data = read_settings(path, quiet=True)
+            settings = data.get("settings") if is_workspace_file else data
+            if isinstance(settings, dict) and remove_c_family_runner_entries(settings):
+                back_up_once(path)
+                with path.open("w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=4)
+                cleaned.append(path)
+        if len(here.parts) - top_depth >= max_depth:
+            subfolders[:] = []
+        else:
+            subfolders[:] = [d for d in subfolders
+                             if d.lower() not in SKIP_FOLDERS and d[:1] != "."]
+    return cleaned
+
+
+def report_play_button(code_cmd: Path | None) -> bool:
+    # read the settings back from disk and show what VS Code will really run.
+    expected = runner_dir_backslash() + "\\run.cmd"
+    all_good = True
+    for path in all_vscode_settings_files(code_cmd):
+        settings = read_settings(path)
+        executor_map = settings.get("code-runner.executorMap")
+        command = executor_map.get("cpp") if isinstance(executor_map, dict) else None
+        ok = isinstance(command, str) and command[:len(expected)] == expected
+        print(f"  {'[ok]  ' if ok else '[FAIL]'} {path}")
+        print(f"         C++ play button runs: {command}")
+        all_good = all_good and ok
+    if not (RUNNER_DIR / "run.cmd").is_file():
+        print(f"  [FAIL] {RUNNER_DIR / 'run.cmd'} is missing")
+        all_good = False
+
+    # the play button itself comes from the Code Runner extension.
+    if code_cmd is None:
+        print("  [FAIL] couldn't find VS Code to check the Code Runner extension")
+        return False
+    result = run([str(code_cmd), "--list-extensions"], timeout=180,
+                 label="checking VS Code's installed extensions...")
+    installed = [line.strip().lower() for line in result.stdout.splitlines()]
+    for ext_id in ["formulahendry.code-runner", "ms-vscode.cpptools"]:
+        ok = ext_id in installed
+        print(f"  {'[ok]  ' if ok else '[FAIL]'} extension {ext_id}")
+        all_good = all_good and ok
+    return all_good
 
 
 def write_json(path: Path, data: dict) -> None:
@@ -755,29 +1366,41 @@ def main() -> int:
     args = parser.parse_args()
 
     projects_dir = Path(args.projects_dir)
-    total_steps = 5
+    total_steps = 6
 
+    print(f"setup_cpp_vscode -- version {SCRIPT_VERSION}")
     print("setting up VS Code for C++.")
     print(f"this is {total_steps} steps, mostly spent downloading things --")
     print("here's what's happening at each point so it's not a black box.")
 
     print_step(f"step 1 of {total_steps}: Visual Studio Code")
-    if not install_vscode():
-        print("\ncouldn't get VS Code installed, so stopping here.")
-        return 1
-
-    code_cmd = find_code_cmd()
+    code_cmd = install_vscode()
     if code_cmd is None:
-        print("\nVS Code reported a successful install, but this script couldn't")
-        print("actually find its code.cmd afterward, so the extensions step below")
-        print("can't run. unusual -- worth a manual look.")
-        return 1
+        # not a reason to stop: the settings below don't need VS Code to exist
+        # yet, and the final check will say clearly what's still missing.
+        print("  couldn't find or install VS Code -- carrying on with everything else.")
 
-    print_step(f"step 2 of {total_steps}: C++ compiler + debugger (via MSYS2)")
+    print_step(f"step 2 of {total_steps}: MSYS2 (where the compiler comes from)")
     if not install_msys2():
         print("\ncouldn't get MSYS2 installed, so stopping here.")
         return 1
 
+    # done before the long MSYS2 update on purpose: if anything later fails,
+    # the play button is still switched over instead of left on an old command.
+    print_step(f"step 3 of {total_steps}: making the play button work in every folder")
+    if not write_runner_files():
+        print("\ncouldn't set up the play button's build script, so stopping here.")
+        return 1
+    write_global_cpp_settings(code_cmd)
+    print("  looking through your folders for old per-folder play-button settings...")
+    cleaned = clean_folder_overrides(Path.home())
+    if cleaned:
+        for path in cleaned:
+            print(f"  removed an old C/C++ play-button setting from {path}")
+    else:
+        print("  none found.")
+
+    print_step(f"step 4 of {total_steps}: C++ compiler + debugger + libraries")
     if not update_msys2_core():
         print("\ncouldn't finish updating MSYS2, so stopping here.")
         return 1
@@ -790,40 +1413,44 @@ def main() -> int:
         print("\ncouldn't finish installing the compiler toolchain, so stopping here.")
         return 1
 
-    print_step(f"step 3 of {total_steps}: VS Code extensions")
+    required = dict(BASE_FILES)
+    if args.allegro:
+        required.update(ALLEGRO_FILES)
+    if not verify_packages(required):
+        print("\nthe toolchain is incomplete even after reinstalling, so stopping here.")
+        return 1
+
+    print_step(f"step 5 of {total_steps}: VS Code extensions")
     if not install_extensions(code_cmd):
         print("\n  a couple extensions didn't install -- carrying on anyway, the")
         print("  core setup doesn't actually depend on them.")
 
-    print_step(f"step 4 of {total_steps}: making this work in every folder, not just one")
-    write_global_cpp_settings()
-
-    print_step(f"step 5 of {total_steps}: starter project")
+    print_step(f"step 6 of {total_steps}: starter projects")
     generate_console_project(projects_dir / "cpp-exercises")
     if args.allegro:
         generate_allegro_project(projects_dir / "allegro-project")
 
+    print("\nchecking what the play button will actually run (read back from disk):")
+    if not report_play_button(code_cmd):
+        print("\nsomething above is marked FAIL -- the play button is NOT set up right.")
+        return 1
+
     print("\nall done. here's what you've got:")
     print("  - a C++ compiler + debugger (MSYS2)")
     print("  - VS Code with a decent extension set")
-    print("  - a play button (and F5) that compiles every .cpp in the folder into")
-    print("    one app.exe, so files can #include each other's headers")
+    print("  - a play button that works in any folder: it compiles every .cpp (or .c)")
+    print("    in the open file's folder into one app.exe, so files can #include")
+    print("    each other's headers. if the code uses Allegro, it builds with Allegro")
+    print("    and puts the DLLs it needs next to the exe automatically.")
     print("  - one main() per folder: each separate program needs its own folder")
     print("  - a ready-to-open starter project at:")
     print(f"      {projects_dir / 'cpp-exercises'}")
     if args.allegro:
-        print("  - an Allegro starter project at:")
+        print("  - an Allegro starter project (with F5 debugging) at:")
         print(f"      {projects_dir / 'allegro-project'}")
-        print("    open THAT folder itself in VS Code (File > Open Folder) -- the play")
-        print("    button spots it's an Allegro project by its CMakeLists.txt.")
-        print("    every build puts app.exe + the DLLs it needs in its build folder,")
-        print("    so that folder runs on any Windows 11 PC by double-clicking app.exe.")
-    print("\nopen that folder in VS Code, open hello.cpp, hit the play button in the")
-    print("top-right of the editor, and it should just run.")
-    print("\none thing worth knowing: terminal tabs that were already open in VS Code")
-    print("before this ran keep their old settings -- they won't switch over on their")
-    print("own. close every terminal tab (or restart VS Code) before the first run;")
-    print("the next one VS Code opens will use the Command Prompt setup this just made.")
+    print("\nAllegro programs end up in a build folder next to the code, holding")
+    print("app.exe + the DLLs it needs -- that folder runs on any Windows 11 PC.")
+    print("\nVS Code picks all of this up straight away, even if it was already open.")
     return 0
 
 
